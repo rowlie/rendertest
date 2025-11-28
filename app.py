@@ -14,7 +14,6 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
 import gradio as gr
-import uvicorn
 
 
 # ========= Environment variables =========
@@ -310,12 +309,11 @@ with gr.Blocks() as demo:
     clear.click(lambda: ("", []), outputs=[msg, chatbot])
 
 
-# Expose an ASGI app for Uvicorn.
-# For Gradio 6, demo.app is the underlying FastAPI/ASGI app.
-app = demo.app
+# For completeness (Render won't use this directly, but it's harmless)
+app = demo
 
 
 if __name__ == "__main__":
-    # Bind explicitly to 0.0.0.0 and Render's PORT using uvicorn
+    # Bind to 0.0.0.0 and the PORT env var, as Render expects
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    demo.launch(server_name="0.0.0.0", server_port=port)
