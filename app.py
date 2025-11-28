@@ -312,6 +312,9 @@ with gr.Blocks() as demo:
 # This `app` object is what Render will serve.
 app = demo
 
+
 if __name__ == "__main__":
-    # Useful for local testing; on Render, just `python app.py`
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 10000)))
+    # Explicit Gradio server so Render detects the bound port
+    port = int(os.environ.get("PORT", 10000))
+    server = gr.Server(app, server_name="0.0.0.0", server_port=port)
+    server.launch()
