@@ -2,17 +2,19 @@
 # RAG + tools + memory agent with LangChain + LangSmith + Gradio for Render
 
 import os
-import json
 from datetime import datetime
+import json
 
 import torch
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
 from openai import OpenAI
+
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
+
 import gradio as gr
 
 
@@ -22,9 +24,9 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 
 if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY env var is not set.")
+    raise ValueError("OPENAI_API_KEY not set.")
 if not PINECONE_API_KEY:
-    raise ValueError("PINECONE_API_KEY env var is not set.")
+    raise ValueError("PINECONE_API_KEY not set.")
 
 
 # ========= RAG config =========
@@ -43,34 +45,35 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(INDEX_NAME)
 print(f"Connected to Pinecone index: {INDEX_NAME}")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-memory = []  # global conversation memory
+# Store only raw text, not LangChain objects
+memory = []
 
 
 # ========= RAG helpers =========
 
 def retrieve_pinecone_context(query: str, top_k: int = TOP_K):
-    xq = retriever.encode(query).tolist()
-    res = index.query(vector=xq, top_k=top_k, include_metadata=True)
-    return res
+    vec = retriever.encode(query).tolist()
+    result = index.query(vector=vec, top_k=top_k, include_metadata=True)
+    return result.matches or []
 
 
 def context_string_from_matches(matches):
-    parts = []
+    out = []
     for m in matches:
-        passage = m["metadata"].get("text") or m["metadata"].get("passage_text") or ""
+        md = m.metadata or {}
+        passage = md.get("text") or md.get("passage_text")
         if passage:
-            parts.append(passage)
-    return "\n\n".join(parts)
+            out.append(passage)
+    return "\n\n".join(out)
 
 
 # ========= Tools =========
 
 @tool
 def calculator(expression: str) -> str:
+    """Evaluate math expressions."""
     try:
         return f"Result: {eval(expression)}"
     except Exception as e:
@@ -99,22 +102,30 @@ def convert_case(text: str, case_type: str) -> str:
 
 
 tools = [calculator, get_current_time, word_count, convert_case]
-print("Loaded tools:", tools)
-
 llm_with_tools = llm.bind_tools(tools)
+
+print("Tools loaded:", [t.name for t in tools])
 
 
 # ========= Agent chain =========
 
 def _build_messages(inputs: dict):
-    user_message = inputs["user_message"]
+    user_msg = inputs["user_message"]
 
-    pinecone_result = retrieve_pinecone_context(user_message)
-    context = context_string_from_matches(pinecone_result.get("matches", []))
+    matches = retrieve_pinecone_context(user_msg)
+    context = context_string_from_matches(matches)
 
-    messages = list(memory)
-    messages.append(HumanMessage(content=user_message))
+    messages = []
+    for m in memory:
+        if m["role"] == "user":
+            messages.append(HumanMessage(content=m["content"]))
+        else:
+            messages.append(AIMessage(content=m["content"]))
 
+    # Add user
+    messages.append(HumanMessage(content=user_msg))
+
+    # Inject RAG context
     if context:
         messages.append(
             HumanMessage(
@@ -129,39 +140,37 @@ build_messages = RunnableLambda(_build_messages)
 
 
 def _first_llm_call(state: dict):
-    response = llm_with_tools.invoke(state["messages"])
-    return {**state, "first_response": response}
+    resp = llm_with_tools.invoke(state["messages"])
+    return {**state, "first_response": resp}
 
 
 first_llm_call = RunnableLambda(_first_llm_call)
 
 
 def _run_tools_if_needed(state: dict):
-    first_response = state["first_response"]
+    resp = state["first_response"]
+    tool_calls = getattr(resp, "tool_calls", None)
+
     messages = state["messages"]
 
-    tool_calls = getattr(first_response, "tool_calls", None)
-    if not tool_calls and hasattr(first_response, "additional_kwargs"):
-        tool_calls = first_response.additional_kwargs.get("tool_calls")
-
     if not tool_calls:
-        return {"messages_with_tools": messages, **state}
+        return {"messages_with_tools": messages + [resp], **state}
 
     tool_messages = []
 
     for call in tool_calls:
         tool_name = call.get("name")
-        args = call.get("args") or {}
+        tool_args = call.get("args", {})
         tool_id = call.get("id", "tool_call")
 
-        matching = [t for t in tools if t.name == tool_name]
-        if not matching:
+        match = next((t for t in tools if t.name == tool_name), None)
+        if not match:
             result = f"Tool '{tool_name}' not found."
         else:
             try:
-                result = matching[0].invoke(args)
+                result = match.run(tool_args)
             except Exception as e:
-                result = f"Error: {e}"
+                result = f"Error: {str(e)}"
 
         tool_messages.append(
             ToolMessage(content=str(result), tool_call_id=tool_id)
@@ -169,7 +178,7 @@ def _run_tools_if_needed(state: dict):
 
     return {
         **state,
-        "messages_with_tools": messages + [first_response] + tool_messages,
+        "messages_with_tools": messages + [resp] + tool_messages
     }
 
 
@@ -177,8 +186,8 @@ run_tools_if_needed = RunnableLambda(_run_tools_if_needed)
 
 
 def _final_llm_call(state: dict):
-    final_response = llm.invoke(state["messages_with_tools"])
-    return {"final_response": final_response, "rag_context": state.get("rag_context", "")}
+    answer = llm.invoke(state["messages_with_tools"])
+    return {"final_response": answer, "rag_context": state.get("rag_context")}
 
 
 final_llm_call = RunnableLambda(_final_llm_call)
@@ -195,15 +204,12 @@ rag_agent_chain = (
 
 def chat_with_rag_and_tools(user_message: str) -> str:
     result = rag_agent_chain.invoke(user_message)
-    final_resp = result["final_response"]
-    rag_context = result.get("rag_context", "")
 
-    memory.append(HumanMessage(content=user_message))
-    if rag_context:
-        memory.append(HumanMessage(content=f"📚 Relevant context:\n{rag_context}"))
-    memory.append(AIMessage(content=final_resp.content))
+    # Store into simple memory
+    memory.append({"role": "user", "content": user_message})
+    memory.append({"role": "assistant", "content": result["final_response"].content})
 
-    return final_resp.content
+    return result["final_response"].content
 
 
 # ========= Gradio App =========
@@ -211,14 +217,16 @@ def chat_with_rag_and_tools(user_message: str) -> str:
 def gradio_chat(user_message, chat_history):
     if not user_message:
         return "", chat_history
-    answer = chat_with_rag_and_tools(user_message)
-    return "", (chat_history or []) + [[user_message, answer]]
+
+    reply = chat_with_rag_and_tools(user_message)
+    chat_history = (chat_history or []) + [[user_message, reply]]
+    return "", chat_history
 
 
 with gr.Blocks() as demo:
     gr.Markdown("## YouTube RAG Chatbot with Tools + LangSmith")
     chatbot = gr.Chatbot(height=400, show_label=False)
-    msg = gr.Textbox(label="Ask")
+    msg = gr.Textbox(label="Ask anything")
     clear = gr.Button("Clear")
 
     msg.submit(gradio_chat, inputs=[msg, chatbot], outputs=[msg, chatbot])
@@ -230,7 +238,7 @@ with gr.Blocks() as demo:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
 
-    demo.queue()  # VERY IMPORTANT FOR RENDER + GRADIO 6
+    demo.queue()
 
     demo.launch(
         server_name="0.0.0.0",
