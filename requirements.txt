@@ -1,0 +1,7 @@
+langchain
+langchain-openai
+pinecone
+sentence-transformers
+openai
+gradio
+torch
