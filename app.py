@@ -1,12 +1,13 @@
-# app.py
 # RAG + tools + memory agent with LangChain + LangSmith + Gradio for Render
+# PORT FIX: LAZY LOADING IMPLEMENTED
 
 import os
 from datetime import datetime
 import json
 
-import torch
-from sentence_transformers import SentenceTransformer
+# Delayed imports to speed up startup
+# import torch 
+# from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
 from openai import OpenAI
 
@@ -34,27 +35,45 @@ if not PINECONE_API_KEY:
 INDEX_NAME = "youtube-qa-index"
 TOP_K = 5
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-retriever = SentenceTransformer(
-    "flax-sentence-embeddings/all_datasets_v3_mpnet-base",
-    device=device,
-)
+# GLOBAL STATE FOR LAZY LOADING
+# We do NOT load the model here. We load it inside the function.
+retriever_model = None 
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(INDEX_NAME)
 print(f"Connected to Pinecone index: {INDEX_NAME}")
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-# Store only raw text, not LangChain objects
 memory = []
 
 
 # ========= RAG helpers =========
 
+def get_retriever():
+    """
+    LAZY LOADER: Only loads the heavy model when absolutely necessary.
+    This prevents the app from crashing during the 'Port Scan' phase.
+    """
+    global retriever_model
+    if retriever_model is None:
+        print("⏳ Loading Embedding Model (Lazy Load)...")
+        import torch
+        from sentence_transformers import SentenceTransformer
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        retriever_model = SentenceTransformer(
+            "flax-sentence-embeddings/all_datasets_v3_mpnet-base",
+            device=device,
+        )
+        print("✅ Model Loaded!")
+    return retriever_model
+
+
 def retrieve_pinecone_context(query: str, top_k: int = TOP_K):
-    vec = retriever.encode(query).tolist()
+    # Load model now (first time only)
+    model = get_retriever()
+    
+    vec = model.encode(query).tolist()
     result = index.query(vector=vec, top_k=top_k, include_metadata=True)
     return result.matches or []
 
@@ -112,6 +131,7 @@ print("Tools loaded:", [t.name for t in tools])
 def _build_messages(inputs: dict):
     user_msg = inputs["user_message"]
 
+    # This will trigger the model load on the first request
     matches = retrieve_pinecone_context(user_msg)
     context = context_string_from_matches(matches)
 
@@ -122,10 +142,8 @@ def _build_messages(inputs: dict):
         else:
             messages.append(AIMessage(content=m["content"]))
 
-    # Add user
     messages.append(HumanMessage(content=user_msg))
 
-    # Inject RAG context
     if context:
         messages.append(
             HumanMessage(
@@ -205,7 +223,6 @@ rag_agent_chain = (
 def chat_with_rag_and_tools(user_message: str) -> str:
     result = rag_agent_chain.invoke(user_message)
 
-    # Store into simple memory
     memory.append({"role": "user", "content": user_message})
     memory.append({"role": "assistant", "content": result["final_response"].content})
 
@@ -224,7 +241,7 @@ def gradio_chat(user_message, chat_history):
 
 
 with gr.Blocks() as demo:
-    gr.Markdown("## YouTube RAG Chatbot with Tools + LangSmith")
+    gr.Markdown("## YouTube RAG Chatbot (Lazy Loaded)")
     chatbot = gr.Chatbot(height=400, show_label=False)
     msg = gr.Textbox(label="Ask anything")
     clear = gr.Button("Clear")
@@ -236,6 +253,7 @@ with gr.Blocks() as demo:
 # ========= REQUIRED FOR RENDER =========
 
 if __name__ == "__main__":
+    # This block now runs INSTANTLY because imports are delayed
     port = int(os.environ.get("PORT", 10000))
 
     demo.queue()
